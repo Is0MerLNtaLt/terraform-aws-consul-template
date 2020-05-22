@@ -1,0 +1,305 @@
+#!/bin/bash
+# This script is used to configure and run Consul Template on an AWS server.
+
+set -e
+
+readonly CONSUL_TEMPLATE_CONFIG_FILE="default.hcl"
+readonly SYSTEMD_CONFIG_PATH="/etc/systemd/system/consul_template.service"
+
+readonly EC2_INSTANCE_METADATA_URL="http://169.254.169.254/latest/meta-data"
+readonly EC2_INSTANCE_DYNAMIC_DATA_URL="http://169.254.169.254/latest/dynamic"
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_NAME="$(basename "$0")"
+
+function print_usage {
+  echo
+  echo "Usage: run-consul-template [OPTIONS]"
+  echo
+  echo "This script is used to configure and run Consul Template on an AWS server."
+  echo
+  echo "Options:"
+  echo
+  echo -e "  --config-dir\t\tThe path to the Consul Template config folder. Optional. Default is the absolute path of '../config', relative to this script."
+  echo -e "  --bin-dir\t\tThe path to the folder with Consul Template binary. Optional. Default is the absolute path of the parent folder of this script."
+  echo -e "  --systemd-stdout\t\tThe StandardOutput option of the systemd unit.  Optional.  If not configured, uses systemd's default (journal)."
+  echo -e "  --systemd-stderr\t\tThe StandardError option of the systemd unit.  Optional.  If not configured, uses systemd's default (inherit)."
+  echo -e "  --user\t\tThe user to run Consul Template as. Optional. Default is to use the owner of --config-dir."
+  echo -e "  --use-sudo\t\tIf set, run the Consul Template with sudo. By default, sudo is only used if --client is set."
+  echo -e "  --environment\t\A single environment variable in the key/value pair form 'KEY=\"val\"' to pass to Consul Template as environment variable when starting it up. Repeat this option for additional variables. Optional."
+  echo -e "  --skip-consul-template-config\tIf this flag is set, don't generate a Consul Template configuration file. Optional. Default is false."
+  echo
+  echo "Example:"
+  echo
+  echo "  run-consul-template --config-dir /custom/path/to/consul-template/config"
+}
+
+function log {
+  local readonly level="$1"
+  local readonly message="$2"
+  local readonly timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  >&2 echo -e "${timestamp} [${level}] [$SCRIPT_NAME] ${message}"
+}
+
+function log_info {
+  local readonly message="$1"
+  log "INFO" "$message"
+}
+
+function log_warn {
+  local readonly message="$1"
+  log "WARN" "$message"
+}
+
+function log_error {
+  local readonly message="$1"
+  log "ERROR" "$message"
+}
+
+# Based on code from: http://stackoverflow.com/a/16623897/483528
+function strip_prefix {
+  local readonly str="$1"
+  local readonly prefix="$2"
+  echo "${str#$prefix}"
+}
+
+function assert_not_empty {
+  local readonly arg_name="$1"
+  local readonly arg_value="$2"
+
+  if [[ -z "$arg_value" ]]; then
+    log_error "The value for '$arg_name' cannot be empty"
+    print_usage
+    exit 1
+  fi
+}
+
+function split_by_lines {
+  local prefix="$1"
+  shift
+
+  for var in "$@"; do
+    echo "${prefix}${var}"
+  done
+}
+
+function lookup_path_in_instance_metadata {
+  local readonly path="$1"
+  curl --silent --location "$EC2_INSTANCE_METADATA_URL/$path/"
+}
+
+function lookup_path_in_instance_dynamic_data {
+  local readonly path="$1"
+  curl --silent --location "$EC2_INSTANCE_DYNAMIC_DATA_URL/$path/"
+}
+
+function assert_is_installed {
+  local readonly name="$1"
+
+  if [[ ! $(command -v ${name}) ]]; then
+    log_error "The binary '$name' is required by this script but is not installed or in the system's PATH."
+    exit 1
+  fi
+}
+
+function generate_consul_template_config {
+  local readonly config_dir="$4"
+  local readonly user="$5"
+  local readonly config_path="$config_dir/$CONSUL_TEMPLATE_CONFIG_FILE"
+
+  local vault_stanza=""
+  vault_stanza=$(cat <<EOF
+vault {
+    address = "http://vault.service.consul:8200"
+    renew_token = true
+  
+    retry {
+        enabled = true
+        attempts = 5
+        backoff = "250ms"
+    }
+}
+EOF
+)
+  fi
+  chown "$user:$user" "$config_path"
+}
+
+function generate_systemd_config {
+  local readonly systemd_config_path="$1"
+  local readonly consul_template_config_dir="$2"
+  local readonly consul_template_bin_dir="$3"
+  local readonly consul_template_sytemd_stdout="$4"
+  local readonly consul_template_sytemd_stderr="$5"
+  local readonly consul_template_user="$6"
+  local readonly use_sudo="$7"
+  shift 8
+  local readonly environment=("$@")
+  local readonly config_path="$consul_template_config_dir/$CONSUL_TEMPLATE_CONFIG_FILE"
+
+  if [[ "$use_sudo" == "true" ]]; then
+    log_info "The --use-sudo flag is set, so running Consul Template as the root user"
+    consul_template_user="root"
+  fi
+
+  log_info "Creating systemd config file to run Consul Template in $systemd_config_path"
+
+  local readonly unit_config=$(cat <<EOF
+[Unit]
+Description="HashiCorp Consul Template"
+Requires=network-online.target
+After=network-online.target
+ConditionalFileNotEmpty=$config_path
+EOF
+)
+
+  local readonly service_config=$(cat <<EOF
+[Service]
+User=$consul_template_user
+Group=$consul_template_user
+ExecStart=$consul_template_bin_dir/consul-template agent -config $consul_template_config_dir
+ExecReload=/bin/kill --signal HUP \$MAINPID
+KillMode=process
+Restart=on-failure
+LimitNOFILE=65536
+$(split_by_lines "Environment=" "${environment[@]}")
+EOF
+)
+
+  local log_config=""
+  if [[ ! -z $consul_template_sytemd_stdout ]]; then
+    log_config+="StandardOutput=$consul_template_sytemd_stdout\n"
+  fi
+  if [[ ! -z $consul_template_sytemd_stderr ]]; then
+    log_config+="StandardError=$consul_template_sytemd_stderr\n"
+  fi
+
+  local readonly install_config=$(cat <<EOF
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+
+  echo -e "$unit_config" > "$systemd_config_path"
+  echo -e "$service_config" >> "$systemd_config_path"
+  echo -e "$log_config" >> "$systemd_config_path"
+  echo -e "$install_config" >> "$systemd_config_path"
+}
+
+function start_consul_template {
+  log_info "Reloading systemd config and starting Consul Template"
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable consul_template.service
+  sudo systemctl restart consul_template.service
+}
+
+# Based on: http://unix.stackexchange.com/a/7732/215969
+function get_owner_of_path {
+  local readonly path="$1"
+  ls -ld "$path" | awk '{print $3}'
+}
+
+function run {
+  local config_dir=""
+  local bin_dir=""
+  local systemd_stdout=""
+  local systemd_stderr=""
+  local user=""
+  local skip_consul_template_config="false"
+  local use_sudo=""
+  local environment=()
+  local all_args=()
+
+  while [[ $# > 0 ]]; do
+    local key="$1"
+
+    case "$key" in
+      --config-dir)
+        assert_not_empty "$key" "$2"
+        config_dir="$2"
+        shift
+        ;;
+      --bin-dir)
+        assert_not_empty "$key" "$2"
+        bin_dir="$2"
+        shift
+        ;;
+      --systemd-stdout)
+        assert_not_empty "$key" "$2"
+        systemd_stdout="$2"
+        shift
+        ;;
+      --systemd-stderr)
+        assert_not_empty "$key" "$2"
+        systemd_stderr="$2"
+        shift
+        ;;
+      --user)
+        assert_not_empty "$key" "$2"
+        user="$2"
+        shift
+        ;;
+      --skip-consul-template-config)
+        skip_consul_tmeplate_config="true"
+        ;;
+      --use-sudo)
+        use_sudo="true"
+        ;;
+      --environment)
+        assert_not_empty "$key" "$2"
+        environment+=("$2")
+        shift
+        ;;
+      --help)
+        print_usage
+        exit
+        ;;
+      *)
+        log_error "Unrecognized argument: $key"
+        print_usage
+        exit 1
+        ;;
+    esac
+
+    shift
+  done
+
+  if [[ -z "$use_sudo" ]]; then
+    if [[ "$client" == "true" ]]; then
+      use_sudo="true"
+    else
+      use_sudo="false"
+    fi
+  fi
+
+  assert_is_installed "systemctl"
+  assert_is_installed "aws"
+  assert_is_installed "curl"
+  assert_is_installed "jq"
+
+  if [[ -z "$config_dir" ]]; then
+    config_dir=$(cd "$SCRIPT_DIR/../config" && pwd)
+  fi
+
+  if [[ -z "$bin_dir" ]]; then
+    bin_dir=$(cd "$SCRIPT_DIR/../bin" && pwd)
+  fi
+
+  # If $systemd_stdout and/or $systemd_stderr are empty, we leave them empty so that generate_systemd_config will use systemd's defaults (journal and inherit, respectively)
+
+  if [[ -z "$user" ]]; then
+    user=$(get_owner_of_path "$config_dir")
+  fi
+
+  if [[ "$skip_consul_template_config" == "true" ]]; then
+    log_info "The --skip-consul-template-config flag is set, so will not generate a default Consul Template config file."
+  else
+    generate_consul_template_config "$config_dir" "$user"
+  fi
+
+  generate_systemd_config "$SYSTEMD_CONFIG_PATH" "$config_dir" "$bin_dir" "$systemd_stdout" "$systemd_stderr" "$user" "$use_sudo" "${environment[@]}"
+  start_consul_template
+}
+
+run "$@"
